@@ -118,13 +118,30 @@ async function performScan(
     };
 
     // 2. 列出根目录下的所有文件夹（强制刷新 OpenList 缓存）
-    const listResponse = await client.listDirectory(rootPath, 1, 100, true);
+    // 循环获取所有页的数据
+    const folders: any[] = [];
+    let currentPage = 1;
+    const pageSize = 100;
+    let total = 0;
 
-    if (listResponse.code !== 200) {
-      throw new Error('OpenList 列表获取失败');
+    while (true) {
+      const listResponse = await client.listDirectory(rootPath, currentPage, pageSize, true);
+
+      if (listResponse.code !== 200) {
+        throw new Error('OpenList 列表获取失败');
+      }
+
+      total = listResponse.data.total;
+      const pageFolders = listResponse.data.content.filter((item) => item.is_dir);
+      folders.push(...pageFolders);
+
+      // 如果已经获取了所有数据，退出循环
+      if (folders.length >= total) {
+        break;
+      }
+
+      currentPage++;
     }
-
-    const folders = listResponse.data.content.filter((item) => item.is_dir);
 
     // 更新任务进度
     updateScanTaskProgress(taskId, 0, folders.length);
