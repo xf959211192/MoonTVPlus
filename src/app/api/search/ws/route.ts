@@ -89,88 +89,84 @@ export async function GET(request: NextRequest) {
       let completedSources = 0;
       const allResults: any[] = [];
 
-      // 搜索 Emby（如果配置了）
+      // 搜索 Emby（如果配置了）- 异步带超时
       if (hasEmby) {
-        try {
-          const { EmbyClient } = await import('@/lib/emby.client');
-          const client = new EmbyClient(config.EmbyConfig!);
-
-          const searchResult = await client.getItems({
-            searchTerm: query,
-            IncludeItemTypes: 'Movie,Series',
-            Recursive: true,
-            Fields: 'Overview,ProductionYear',
-            Limit: 50,
+        Promise.race([
+          (async () => {
+            const { EmbyClient } = await import('@/lib/emby.client');
+            const client = new EmbyClient(config.EmbyConfig!);
+            const searchResult = await client.getItems({
+              searchTerm: query,
+              IncludeItemTypes: 'Movie,Series',
+              Recursive: true,
+              Fields: 'Overview,ProductionYear',
+              Limit: 50,
+            });
+            return searchResult.Items.map((item) => ({
+              id: item.Id,
+              source: 'emby',
+              source_name: 'Emby',
+              title: item.Name,
+              poster: client.getImageUrl(item.Id, 'Primary'),
+              episodes: [],
+              episodes_titles: [],
+              year: item.ProductionYear?.toString() || '',
+              desc: item.Overview || '',
+              type_name: item.Type === 'Movie' ? '电影' : '电视剧',
+              douban_id: 0,
+            }));
+          })(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Emby timeout')), 20000)
+          ),
+        ])
+          .then((embyResults) => {
+            completedSources++;
+            if (!streamClosed) {
+              const sourceEvent = `data: ${JSON.stringify({
+                type: 'source_result',
+                source: 'emby',
+                sourceName: 'Emby',
+                results: embyResults,
+                timestamp: Date.now()
+              })}\n\n`;
+              if (!safeEnqueue(encoder.encode(sourceEvent))) {
+                streamClosed = true;
+                return;
+              }
+              if (embyResults.length > 0) {
+                allResults.push(...embyResults);
+              }
+            }
+          })
+          .catch((error) => {
+            console.error('[Search WS] 搜索 Emby 失败:', error);
+            completedSources++;
+            if (!streamClosed) {
+              const errorEvent = `data: ${JSON.stringify({
+                type: 'source_error',
+                source: 'emby',
+                sourceName: 'Emby',
+                error: error instanceof Error ? error.message : '搜索失败',
+                timestamp: Date.now()
+              })}\n\n`;
+              safeEnqueue(encoder.encode(errorEvent));
+            }
           });
-
-          const embyResults = searchResult.Items.map((item) => ({
-            id: item.Id,
-            source: 'emby',
-            source_name: 'Emby',
-            title: item.Name,
-            poster: client.getImageUrl(item.Id, 'Primary'),
-            episodes: [],
-            episodes_titles: [],
-            year: item.ProductionYear?.toString() || '',
-            desc: item.Overview || '',
-            type_name: item.Type === 'Movie' ? '电影' : '电视剧',
-            douban_id: 0,
-          }));
-
-          completedSources++;
-
-          if (!streamClosed) {
-            const sourceEvent = `data: ${JSON.stringify({
-              type: 'source_result',
-              source: 'emby',
-              sourceName: 'Emby',
-              results: embyResults,
-              timestamp: Date.now()
-            })}\n\n`;
-
-            if (!safeEnqueue(encoder.encode(sourceEvent))) {
-              streamClosed = true;
-              return;
-            }
-
-            if (embyResults.length > 0) {
-              allResults.push(...embyResults);
-            }
-          }
-        } catch (error) {
-          console.error('[Search WS] 搜索 Emby 失败:', error);
-          completedSources++;
-
-          if (!streamClosed) {
-            const errorEvent = `data: ${JSON.stringify({
-              type: 'source_error',
-              source: 'emby',
-              sourceName: 'Emby',
-              error: error instanceof Error ? error.message : '搜索失败',
-              timestamp: Date.now()
-            })}\n\n`;
-
-            if (!safeEnqueue(encoder.encode(errorEvent))) {
-              streamClosed = true;
-              return;
-            }
-          }
-        }
       }
 
-      // 搜索 OpenList（如果配置了）
+      // 搜索 OpenList（如果配置了）- 异步带超时
       if (hasOpenList) {
-        try {
-          const { getCachedMetaInfo, setCachedMetaInfo } = await import('@/lib/openlist-cache');
-          const { getTMDBImageUrl } = await import('@/lib/tmdb.search');
-          const { db } = await import('@/lib/db');
+        Promise.race([
+          (async () => {
+            const { getCachedMetaInfo, setCachedMetaInfo } = await import('@/lib/openlist-cache');
+            const { getTMDBImageUrl } = await import('@/lib/tmdb.search');
+            const { db } = await import('@/lib/db');
 
-          const rootPath = config.OpenListConfig!.RootPath || '/';
-          let metaInfo = getCachedMetaInfo(rootPath);
+            const rootPath = config.OpenListConfig!.RootPath || '/';
+            let metaInfo = getCachedMetaInfo(rootPath);
 
-          // 如果没有缓存，尝试从数据库读取
-          if (!metaInfo) {
-            try {
+            if (!metaInfo) {
               const metainfoJson = await db.getGlobalValue('video.metainfo');
               if (metainfoJson) {
                 metaInfo = JSON.parse(metainfoJson);
@@ -178,34 +174,37 @@ export async function GET(request: NextRequest) {
                   setCachedMetaInfo(rootPath, metaInfo);
                 }
               }
-            } catch (error) {
-              console.error('[Search WS] 从数据库读取 metainfo 失败:', error);
             }
-          }
 
-          if (metaInfo && metaInfo.folders) {
-            const openlistResults = Object.entries(metaInfo.folders)
-              .filter(([key, info]: [string, any]) => {
-                const matchFolder = info.folderName.toLowerCase().includes(query.toLowerCase());
-                const matchTitle = info.title.toLowerCase().includes(query.toLowerCase());
-                return matchFolder || matchTitle;
-              })
-              .map(([key, info]: [string, any]) => ({
-                id: key,
-                source: 'openlist',
-                source_name: '私人影库',
-                title: info.title,
-                poster: getTMDBImageUrl(info.poster_path),
-                episodes: [],
-                episodes_titles: [],
-                year: info.release_date.split('-')[0] || '',
-                desc: info.overview,
-                type_name: info.media_type === 'movie' ? '电影' : '电视剧',
-                douban_id: 0,
-              }));
-
+            if (metaInfo && metaInfo.folders) {
+              return Object.entries(metaInfo.folders)
+                .filter(([key, info]: [string, any]) => {
+                  const matchFolder = info.folderName.toLowerCase().includes(query.toLowerCase());
+                  const matchTitle = info.title.toLowerCase().includes(query.toLowerCase());
+                  return matchFolder || matchTitle;
+                })
+                .map(([key, info]: [string, any]) => ({
+                  id: key,
+                  source: 'openlist',
+                  source_name: '私人影库',
+                  title: info.title,
+                  poster: getTMDBImageUrl(info.poster_path),
+                  episodes: [],
+                  episodes_titles: [],
+                  year: info.release_date.split('-')[0] || '',
+                  desc: info.overview,
+                  type_name: info.media_type === 'movie' ? '电影' : '电视剧',
+                  douban_id: 0,
+                }));
+            }
+            return [];
+          })(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('OpenList timeout')), 20000)
+          ),
+        ])
+          .then((openlistResults) => {
             completedSources++;
-
             if (!streamClosed) {
               const sourceEvent = `data: ${JSON.stringify({
                 type: 'source_result',
@@ -214,53 +213,29 @@ export async function GET(request: NextRequest) {
                 results: openlistResults,
                 timestamp: Date.now()
               })}\n\n`;
-
               if (!safeEnqueue(encoder.encode(sourceEvent))) {
                 streamClosed = true;
                 return;
               }
-
               if (openlistResults.length > 0) {
                 allResults.push(...openlistResults);
               }
             }
-          } else {
+          })
+          .catch((error) => {
+            console.error('[Search WS] 搜索 OpenList 失败:', error);
             completedSources++;
-
             if (!streamClosed) {
-              const sourceEvent = `data: ${JSON.stringify({
-                type: 'source_result',
+              const errorEvent = `data: ${JSON.stringify({
+                type: 'source_error',
                 source: 'openlist',
                 sourceName: '私人影库',
-                results: [],
+                error: error instanceof Error ? error.message : '搜索失败',
                 timestamp: Date.now()
               })}\n\n`;
-
-              if (!safeEnqueue(encoder.encode(sourceEvent))) {
-                streamClosed = true;
-                return;
-              }
+              safeEnqueue(encoder.encode(errorEvent));
             }
-          }
-        } catch (error) {
-          console.error('[Search WS] 搜索 OpenList 失败:', error);
-          completedSources++;
-
-          if (!streamClosed) {
-            const errorEvent = `data: ${JSON.stringify({
-              type: 'source_error',
-              source: 'openlist',
-              sourceName: '私人影库',
-              error: error instanceof Error ? error.message : '搜索失败',
-              timestamp: Date.now()
-            })}\n\n`;
-
-            if (!safeEnqueue(encoder.encode(errorEvent))) {
-              streamClosed = true;
-              return;
-            }
-          }
-        }
+          });
       }
 
       // 为每个源创建搜索 Promise
